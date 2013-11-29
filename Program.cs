@@ -16,9 +16,19 @@ using System.Windows.Forms;
 namespace Ndexer {
     public class ActiveWorker : IDisposable {
         public string Description = null;
-
+        public string Progress {
+            get { return Progress;}
+            set {
+                UInt16 v = Convert.ToUInt16(value);
+                if ((v == 0) || (v == 100))
+                    Progress = null;
+                else
+                    Progress = value + @"%";
+            }
+        }
         public ActiveWorker (string description) {
             Description = description;
+            Progress = "0";
             Resume();
         }
 
@@ -99,27 +109,44 @@ namespace Ndexer {
             Application.SetCompatibleTextRenderingDefault(false);
 
             if (argv.Length < 1) {
-                using (var dlg = new SaveFileDialog()) {
-                    dlg.Title = "Select Index Database";
-                    dlg.Filter = "Index Databases (*.db)|*.db";
-                    dlg.CheckFileExists = false;
-                    dlg.CheckPathExists = true;
-                    dlg.AddExtension = true;
-                    dlg.AutoUpgradeEnabled = true;
-                    dlg.OverwritePrompt = false;
-
-                    if (dlg.ShowDialog() != DialogResult.OK) {
-                        MessageBox.Show(
-                            "NDexer cannot start without a path specified for the index database on the command line.\n" +
-                            @"For example: ndexer.exe C:\mysource\index.db",
-                            "NDexer Error"
-                        );
-                        return;
-                    } else {
+                var result = MessageBox.Show("Creating new index?", 
+                            "Loading index",
+                             MessageBoxButtons.YesNoCancel,
+                             MessageBoxIcon.Question);
+                if (result == DialogResult.Yes)
+                {
+                    using (var dlg = new SaveFileDialog())
+                    {
+                        dlg.Title = "Create an index";
+                        dlg.Filter = "Index Databases (*.db)|*.db";
+                        dlg.CheckPathExists = true;
+                        dlg.AddExtension = true;
+                        dlg.AutoUpgradeEnabled = true;
+                        if (dlg.ShowDialog() != DialogResult.OK)
+                        {
+                            return;
+                        }
                         DatabasePath = dlg.FileName;
                     }
+                } else if (result == DialogResult.No) {
+                    using (var dlg = new OpenFileDialog())
+                    {
+                        dlg.Title = "Load an index";
+                        dlg.Filter = "Index Databases (*.db)|*.db";
+                        dlg.CheckFileExists = true;
+                        dlg.AddExtension = true;
+                        dlg.AutoUpgradeEnabled = true;
+                        if (dlg.ShowDialog() != DialogResult.OK)
+                        {
+                            return;
+                        }
+                        DatabasePath = dlg.FileName;
+                    }
+                } else {
+                    return;
                 }
-            } else {
+            }
+            else {
                 DatabasePath = System.IO.Path.GetFullPath(argv[0]);
             }
 
@@ -251,7 +278,9 @@ namespace Ndexer {
         }
 
         public static IEnumerator<object> RebuildIndexTask (bool saveOldData) {
-            using (new ActiveWorker("Rebuilding index...")) {
+            using (var a = new ActiveWorker("Rebuilding index...")) {
+                int progress = 0; a.Progress = progress.ToString();
+
                 var conn = new SQLiteConnection(String.Format("Data Source={0}", DatabasePath + "_new"));
                 conn.Open();
                 var cw = new ConnectionWrapper(Scheduler, conn);
@@ -266,29 +295,50 @@ namespace Ndexer {
                 var trans = cw.CreateTransaction();
                 yield return trans;
 
-                if (saveOldData)
+                progress = 10; a.Progress = progress.ToString();
+
+                if (saveOldData) {
                     using (var iter = new TaskEnumerator<TagDatabase.Folder>(Database.GetFolders()))
                     while (!iter.Disposed) {
                         yield return iter.Fetch();
 
-                        foreach (TagDatabase.Folder item in iter)
+                        double total = 0.0;
+                        foreach (TagDatabase.Folder item in iter) total++;
+                        double step = 40.0/total;
+                        total = 0.0;
+                        foreach (TagDatabase.Folder item in iter) {
                             yield return cw.ExecuteSQL(
                                 "INSERT INTO Folders (Folders_Path, Folders_Excluded) VALUES (?, ?)",
                                 item.Path, item.Excluded
                             );
+                            total += step;
+                            progress = progress + (int)total; 
+                            a.Progress = progress.ToString();
+                        }
                     }
+                }
+                a.Progress = "50";
 
-                if (saveOldData)
+                if (saveOldData) { 
                     using (var iter = new TaskEnumerator<TagDatabase.Filter>(Database.GetFilters()))
                     while (!iter.Disposed) {
                         yield return iter.Fetch();
-
-                        foreach (TagDatabase.Filter item in iter)
+                        double total = 0.0;
+                        foreach (TagDatabase.Filter item in iter) total++;
+                        double step = 20.0 / total;
+                        total = 0.0;
+                        foreach (TagDatabase.Filter item in iter) {
                             yield return cw.ExecuteSQL(
                                 "INSERT INTO Filters (Filters_Pattern) VALUES (?)",
                                 item.Pattern
                             );
+                            total += step;
+                            progress = progress + (int)total; 
+                            a.Progress = progress.ToString();
+                        }
                     }
+                }
+                a.Progress = "70";
 
                 if (saveOldData)
                     using (var iter = Database.Connection.BuildQuery(
@@ -303,11 +353,14 @@ namespace Ndexer {
                                 item.GetValue(0), item.GetValue(1)
                             );
                     }
+                
+                a.Progress = "90";
 
                 yield return trans.Commit();
 
                 yield return Database.Connection.Dispose();
 
+                a.Progress = "100";
                 yield return RestartTask();
             }
         }
@@ -468,7 +521,7 @@ namespace Ndexer {
                 if (numWorkers > 0) {
                     theIcon = (toggle) ? Icon_Working_1 : Icon_Working_2;
                     lock (ActiveWorkers)
-                        statusMessage = ": " + ActiveWorkers[0].Description;
+                        statusMessage = ": " + ActiveWorkers[0].Description + " " + ActiveWorkers[0].Progress;
                 } else {
                     theIcon = Icon_Monitoring;
                 }
@@ -476,7 +529,7 @@ namespace Ndexer {
                 var dbName = Path.GetDirectoryName(DatabasePath);
                 dbName = Path.Combine(dbName.Substring(dbName.LastIndexOf('\\') + 1), Path.GetFileNameWithoutExtension(DatabasePath));
 
-                TrayCaption = String.Format("NDexer r{2} ({0}){1}", dbName, statusMessage, Revision);
+                TrayCaption = String.Format("{0}:{1}", dbName, statusMessage);
                 if (TrayCaption.Length >= 64)
                     TrayCaption = TrayCaption.Substring(0, 60) + "...";
 
